@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/cockroachdb/pebble"
 )
@@ -35,21 +38,39 @@ func main() {
 		log.Fatalf("Failed to start server: %v", err)
 	}
 	log.Println("Redis-compatible server running on :6379")
+	// Handle SIGTERM for graceful shutdown
+	sigCh := make(chan os.Signal, 1)
+	quitCh := make(chan os.Signal)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 
+	var wg sync.WaitGroup
+	go func() {
+		<-sigCh
+		log.Println("Received shutdown signal, closing server...")
+		close(quitCh)    // Notify all goroutines to stop
+		listener.Close() // Stop accepting new connections
+		wg.Wait()        // Wait for all connections to close
+		db.Flush()
+		log.Println("Server shutdown complete")
+		os.Exit(0)
+	}()
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
 			log.Printf("Failed to accept connection: %v", err)
 			continue
 		}
-		go handleConnection(conn)
+		wg.Add(1)
+		go handleConnection(conn, &wg)
 	}
+
 }
 
-func handleConnection(conn net.Conn) {
+func handleConnection(conn net.Conn, wg *sync.WaitGroup) {
 	defer func() {
 		log.Printf("Client disconnected: %s", conn.RemoteAddr().String())
 		conn.Close()
+		wg.Done()
 	}()
 
 	reader := bufio.NewReader(conn)
@@ -134,13 +155,13 @@ func handleCommand(cmd string, args []string) string {
 			return "-ERR wrong number of arguments for 'get' command\r\n"
 		}
 		res, closer, err := db.Get([]byte(args[0]))
-		defer closer.Close()
 		if err != nil {
 			if err == pebble.ErrNotFound {
 				return "$-1\r\n" // RESP representation for nil
 			}
 			return "-ERR Failed to get key: " + err.Error() + "\r\n"
 		}
+		defer closer.Close()
 		return fmt.Sprintf("$%d\r\n%s\r\n", len(res), res)
 	default:
 		return "-ERR unknown command\r\n"
